@@ -388,7 +388,18 @@ void DbgAdapter::emitStoppedState(const QString & reason, const REGDUMP & dump)
 {
     emit registersUpdated(dump);
     emit stopped(dump.regcontext.cip, reason + threadSuffix());
-    refreshThreads();
+    scheduleThreadRefresh();
+}
+
+void DbgAdapter::scheduleThreadRefresh()
+{
+    if(mThreadRefreshQueued.exchange(true))
+        return;
+    QMetaObject::invokeMethod(this, [this]
+    {
+        mThreadRefreshQueued = false;
+        refreshThreads();
+    }, Qt::QueuedConnection);
 }
 
 void DbgAdapter::onCreateProcess(const pid_t pid, const uint64_t entryPoint, void* userdata)
@@ -415,14 +426,14 @@ void DbgAdapter::onExitProcess(const int exitCode, void* userdata)
     }
     emit self->processExited(exitCode);
     emit self->sessionEnded();
-    self->refreshThreads();
+    self->scheduleThreadRefresh();
 }
 
 void DbgAdapter::onCreateThread(const pid_t tid, void* userdata)
 {
     auto* self = static_cast<DbgAdapter*>(userdata);
     emit self->logMessage(QString("[x64dbg] Thread %1 created").arg(tid));
-    self->refreshThreads();
+    self->scheduleThreadRefresh();
 }
 
 void DbgAdapter::onExitThread(const pid_t tid, void* userdata)
@@ -433,7 +444,7 @@ void DbgAdapter::onExitThread(const pid_t tid, void* userdata)
         std::lock_guard lock(self->mThreadNameMutex);
         self->mThreadNames.remove(tid);
     }
-    self->refreshThreads();
+    self->scheduleThreadRefresh();
 }
 
 void DbgAdapter::onSystemBreakpoint(void* userdata)
@@ -461,7 +472,7 @@ void DbgAdapter::onExec(void* userdata)
 {
     const auto self = static_cast<DbgAdapter*>(userdata);
     emit self->logMessage(QStringLiteral("[x64dbg] %1").arg(tr("The debuggee replaced its image with execve")));
-    self->refreshThreads();
+    self->scheduleThreadRefresh();
 }
 
 void DbgAdapter::onDetach(void* userdata)

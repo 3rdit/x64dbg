@@ -65,14 +65,9 @@ namespace ElfBug
     private:
         // Guards the breakpoint maps, which any thread touches while the tracee is paused.
         mutable std::shared_mutex mBreakpointMutex;
-        BreakpointMap mBreakpoints;
-        BreakpointCallbackMap mBreakpointCallbacks;
-        SoftwareBreakpointMap mSoftwareBreakpointReferences;
-        MemoryBreakpointSet mMemoryBreakpointRanges;
-        MemoryBreakpointMap mMemoryBreakpointPages;
-        bool setBreakpointLocked(ptr address, bool singleshot, SoftwareType type);
+        SoftwareBreakpointMap mBreakpoints;
+        SoftwareBreakpoint* setBreakpointLocked(ptr address, bool singleshot);
         bool pokeByte(ptr address, uint8 byte);
-        void forgetSoftwareLocked(ptr address);
         BreakpointInfo* findSoftwareBreakpoint(ptr address);
         void unpatchBreakpointBytesLocked(ptr address, void* buffer, ptr size) const;
 

@@ -16,6 +16,7 @@
 #include <mutex>
 #include <set>
 #include <shared_mutex>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -27,7 +28,12 @@ namespace
 
     std::size_t registerOffset(const char* name)
     {
-        static const std::unordered_map<std::string, std::size_t> offsets =
+        struct RegisterName
+        {
+            const char* name;
+            std::size_t offset;
+        };
+        static constexpr RegisterName offsets[] =
         {
             {"csp", offsetof(user_regs_struct, rsp)}, {"rsp", offsetof(user_regs_struct, rsp)},
             {"cip", offsetof(user_regs_struct, rip)}, {"rip", offsetof(user_regs_struct, rip)},
@@ -40,8 +46,90 @@ namespace
             {"r12", offsetof(user_regs_struct, r12)}, {"r13", offsetof(user_regs_struct, r13)},
             {"r14", offsetof(user_regs_struct, r14)}, {"r15", offsetof(user_regs_struct, r15)},
         };
-        const auto it = offsets.find(name);
-        return it == offsets.end() ? kNoRegister : it->second;
+        for(const auto & entry : offsets)
+        {
+            if(strcmp(entry.name, name) == 0)
+                return entry.offset;
+        }
+        return kNoRegister;
+    }
+
+    uint64_t bootTimeMs()
+    {
+        static const uint64_t bootTime = []
+        {
+            uint64_t result = 0;
+            FILE* f = fopen("/proc/stat", "r");
+            if(!f)
+                return result;
+            char line[256];
+            while(fgets(line, sizeof(line), f))
+            {
+                uint64_t btime = 0;
+                if(sscanf(line, "btime %" SCNu64, &btime) == 1)
+                {
+                    result = btime * 1000u;
+                    break;
+                }
+            }
+            fclose(f);
+            return result;
+        }();
+        return bootTime;
+    }
+
+    void readThreadName(const pid_t pid, const pid_t tid, char* name, const size_t size)
+    {
+        name[0] = '\0';
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/task/%d/comm", pid, tid);
+        FILE* f = fopen(path, "r");
+        if(!f)
+            return;
+        if(fgets(name, static_cast<int>(size), f))
+            name[strcspn(name, "\n")] = '\0';
+        fclose(f);
+    }
+
+    void readThreadStat(const pid_t pid, const pid_t tid, ElfBugThreadInfo & info)
+    {
+        info.policy = -1;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", pid, tid);
+        FILE* f = fopen(path, "r");
+        if(!f)
+            return;
+        char line[1024];
+        const bool ok = fgets(line, sizeof(line), f) != nullptr;
+        fclose(f);
+        if(!ok)
+            return;
+
+        const char* fields = strrchr(line, ')');
+        if(!fields)
+            return;
+        uint64_t utime = 0, stime = 0, starttime = 0;
+        int32_t nice = 0;
+        uint32_t rtPriority = 0, policy = 0;
+        const int matched = sscanf(fields + 1,
+                                   " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %" SCNu64 " %" SCNu64
+                                   " %*d %*d %*d %" SCNd32 " %*d %*d %" SCNu64
+                                   " %*u %*d %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*d %*d %" SCNu32 " %" SCNu32,
+                                   &utime, &stime, &nice, &starttime, &rtPriority, &policy);
+        if(matched != 6)
+            return;
+
+        const long ticks = sysconf(_SC_CLK_TCK);
+        if(ticks <= 0)
+            return;
+        const auto ticksPerSecond = static_cast<uint64_t>(ticks);
+        info.user_time_ms = utime * 1000u / ticksPerSecond;
+        info.kernel_time_ms = stime * 1000u / ticksPerSecond;
+        const uint64_t boot = bootTimeMs();
+        info.start_time_ms = boot ? boot + starttime * 1000u / ticksPerSecond : 0;
+        info.nice = nice;
+        info.rt_priority = static_cast<int32_t>(rtPriority);
+        info.policy = static_cast<int32_t>(policy);
     }
 
     ElfBugArch toApiArch(const ElfBug::Arch arch)
@@ -79,6 +167,7 @@ struct ElfBugDebugger : ElfBug::Debugger
     {
         uint64_t start = 0;
         uint64_t end = 0;
+        uint64_t moduleBase = 0;
         bool executable = false;
         std::string pathname;
     };
@@ -91,7 +180,7 @@ struct ElfBugDebugger : ElfBug::Debugger
 
     struct RegisterRequest
     {
-        std::string name;
+        std::size_t offset = 0;
         uint64_t value = 0;
         bool done = false;
         bool ok = false;
@@ -262,13 +351,23 @@ struct ElfBugDebugger : ElfBug::Debugger
 
     uint32_t GetThreadList(ElfBugThreadInfo* list, const uint32_t capacity) const
     {
-        std::lock_guard lock(mThreadMutex);
-        const auto count = static_cast<uint32_t>(mThreadList.size());
-        if(list)
+        uint32_t count = 0;
+        uint32_t n = 0;
         {
-            const uint32_t n = std::min(count, capacity);
+            std::lock_guard lock(mThreadMutex);
+            count = static_cast<uint32_t>(mThreadList.size());
+            if(!list)
+                return count;
+            n = std::min(count, capacity);
             for(uint32_t i = 0; i < n; ++i)
                 list[i] = mThreadList[i];
+        }
+
+        const pid_t pid = Pid();
+        for(uint32_t i = 0; i < n; ++i)
+        {
+            readThreadStat(pid, list[i].tid, list[i]);
+            readThreadName(pid, list[i].tid, list[i].name, sizeof(list[i].name));
         }
         return count;
     }
@@ -295,7 +394,7 @@ struct ElfBugDebugger : ElfBug::Debugger
         if(!mActive.load(std::memory_order_acquire) || !mThread)
             return false;
 
-        const auto native = mThread->registers.Native();
+        const auto & native = mThread->registers.Native();
 
         out->rax = native.rax;
         out->rbx = native.rbx;
@@ -351,13 +450,14 @@ struct ElfBugDebugger : ElfBug::Debugger
     {
         if(!mActive.load(std::memory_order_acquire) || !IsPaused())
             return false;
-        if(registerOffset(name) == kNoRegister)
+        const std::size_t offset = registerOffset(name);
+        if(offset == kNoRegister)
             return false;
         if(mLoopThread.load(std::memory_order_acquire) == std::this_thread::get_id())
-            return writeRegisterOnTracer(name, value);
+            return writeRegisterOnTracer(offset, value);
 
         auto request = std::make_shared<RegisterRequest>();
-        request->name = name;
+        request->offset = offset;
         request->value = value;
 
         std::unique_lock lock(mRegisterQueueMutex);
@@ -562,81 +662,6 @@ private:
         return reason;
     }
 
-    static void readThreadName(const pid_t pid, const pid_t tid, char* name, const size_t size)
-    {
-        name[0] = '\0';
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%d/task/%d/comm", pid, tid);
-        FILE* f = fopen(path, "r");
-        if(!f)
-            return;
-        if(fgets(name, static_cast<int>(size), f))
-            name[strcspn(name, "\n")] = '\0';
-        fclose(f);
-    }
-
-    uint64_t readBootTimeMs()
-    {
-        if(mBootTimeMs != 0)
-            return mBootTimeMs;
-        FILE* f = fopen("/proc/stat", "r");
-        if(!f)
-            return 0;
-        char line[256];
-        while(fgets(line, sizeof(line), f))
-        {
-            uint64_t btime = 0;
-            if(sscanf(line, "btime %" SCNu64, &btime) == 1)
-            {
-                mBootTimeMs = btime * 1000u;
-                break;
-            }
-        }
-        fclose(f);
-        return mBootTimeMs;
-    }
-
-    void readThreadStat(const pid_t pid, const pid_t tid, ElfBugThreadInfo & info)
-    {
-        info.policy = -1;
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", pid, tid);
-        FILE* f = fopen(path, "r");
-        if(!f)
-            return;
-        char line[1024];
-        const bool ok = fgets(line, sizeof(line), f) != nullptr;
-        fclose(f);
-        if(!ok)
-            return;
-
-        const char* fields = strrchr(line, ')');
-        if(!fields)
-            return;
-        uint64_t utime = 0, stime = 0, starttime = 0;
-        int32_t nice = 0;
-        uint32_t rtPriority = 0, policy = 0;
-        const int matched = sscanf(fields + 1,
-                                   " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %" SCNu64 " %" SCNu64
-                                   " %*d %*d %*d %" SCNd32 " %*d %*d %" SCNu64
-                                   " %*u %*d %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*d %*d %" SCNu32 " %" SCNu32,
-                                   &utime, &stime, &nice, &starttime, &rtPriority, &policy);
-        if(matched != 6)
-            return;
-
-        const long ticks = sysconf(_SC_CLK_TCK);
-        if(ticks <= 0)
-            return;
-        const auto ticksPerSecond = static_cast<uint64_t>(ticks);
-        info.user_time_ms = utime * 1000u / ticksPerSecond;
-        info.kernel_time_ms = stime * 1000u / ticksPerSecond;
-        const uint64_t boot = readBootTimeMs();
-        info.start_time_ms = boot ? boot + starttime * 1000u / ticksPerSecond : 0;
-        info.nice = nice;
-        info.rt_priority = static_cast<int32_t>(rtPriority);
-        info.policy = static_cast<int32_t>(policy);
-    }
-
     void refreshThreadList(const bool withRegisters)
     {
         std::lock_guard threads(mThreadMutex);
@@ -657,7 +682,6 @@ private:
                     info.number = number->second;
                     info.rip = thread->registers.Native().rip;
                     info.fs_base = thread->registers.Native().fs_base;
-                    readThreadStat(mProcess->pid, tid, info);
                     info.suspend_count = thread->SuspendCount();
                     std::string reason = thread->WaitReason();
                     if(reason.empty())
@@ -667,7 +691,6 @@ private:
                             reason = sampled->second;
                     }
                     copyString(info.wait_reason, sizeof(info.wait_reason), reason);
-                    readThreadName(mProcess->pid, tid, info.name, sizeof(info.name));
                     list.push_back(info);
                 }
             }
@@ -681,23 +704,26 @@ private:
 
     void refreshMemoryMap()
     {
-        std::vector<MemRegion> newMaps;
-        if(!mProcess)
-        {
-            std::lock_guard lock(mMapMutex);
-            mMemoryMap.clear();
+        std::lock_guard lock(mMapMutex);
+        mMapDirty = true;
+    }
+
+    void loadMemoryMapLocked() const
+    {
+        if(!mMapDirty)
             return;
-        }
+        mMapDirty = false;
+        mMemoryMap.clear();
+
+        const pid_t pid = Pid();
+        if(pid <= 0)
+            return;
 
         char path[64];
-        snprintf(path, sizeof(path), "/proc/%d/maps", mProcess->pid);
+        snprintf(path, sizeof(path), "/proc/%d/maps", pid);
         FILE* f = fopen(path, "r");
         if(!f)
-        {
-            std::lock_guard lock(mMapMutex);
-            mMemoryMap.clear();
             return;
-        }
 
         char line[512];
         while(fgets(line, sizeof(line), f))
@@ -728,26 +754,21 @@ private:
                 }
             }
 
-            newMaps.push_back({start, end, perms[2] == 'x', std::move(pathname)});
+            mMemoryMap.push_back({start, end, 0, perms[2] == 'x', std::move(pathname)});
         }
         fclose(f);
 
-        std::lock_guard lock(mMapMutex);
-        mMemoryMap = std::move(newMaps);
-
-        mModuleBases.clear();
-        for(const auto& r : mMemoryMap)
+        std::unordered_map<std::string_view, uint64_t> bases;
+        for(auto & region : mMemoryMap)
         {
-            if(r.pathname.empty())
-                continue;
-            auto it = mModuleBases.find(r.pathname);
-            if(it == mModuleBases.end() || r.start < it->second)
-                mModuleBases[r.pathname] = r.start;
+            if(!region.pathname.empty())
+                region.moduleBase = bases.try_emplace(region.pathname, region.start).first->second;
         }
     }
 
     const MemRegion* findRegion(const uint64_t addr) const
     {
+        loadMemoryMapLocked();
         auto it = std::upper_bound(mMemoryMap.begin(), mMemoryMap.end(), addr,
         [](const uint64_t a, const MemRegion & r) { return a < r.start; });
         if(it != mMemoryMap.begin())
@@ -766,12 +787,8 @@ private:
         if(!region || region->pathname.empty())
             return false;
 
-        const auto it = mModuleBases.find(region->pathname);
-        if(it == mModuleBases.end())
-            return false;
-
         if(baseOut)
-            *baseOut = it->second;
+            *baseOut = region->moduleBase;
         if(pathOut)
             *pathOut = region->pathname;
         return true;
@@ -806,12 +823,8 @@ private:
         mPendingBreakpoints.clear();
     }
 
-    bool writeRegisterOnTracer(const std::string & name, const uint64_t value) const
+    bool writeRegisterOnTracer(const std::size_t offset, const uint64_t value) const
     {
-        const std::size_t offset = registerOffset(name.c_str());
-        if(offset == kNoRegister)
-            return false;
-
         std::unique_lock lock(mProcessMutex);
         if(!mThread)
             return false;
@@ -839,7 +852,7 @@ private:
             std::lock_guard lock(mRegisterQueueMutex);
             if(request->abandoned)
                 continue;
-            request->ok = writeRegisterOnTracer(request->name, request->value);
+            request->ok = writeRegisterOnTracer(request->offset, request->value);
             request->done = true;
         }
         mRegisterQueueCv.notify_all();
@@ -852,7 +865,7 @@ private:
         {
             std::lock_guard lock(mMapMutex);
             mMemoryMap.clear();
-            mModuleBases.clear();
+            mMapDirty = false;
         }
         {
             std::lock_guard lock(mBreakpointMutex);
@@ -882,11 +895,10 @@ private:
     std::atomic<bool> mActive{false};
     std::atomic<pid_t> mActivePid{0};
     uint64_t mEntryPoint = 0;
-    uint64_t mBootTimeMs = 0;
 
     mutable std::mutex mMapMutex;
-    std::vector<MemRegion> mMemoryMap;
-    std::unordered_map<std::string, uint64_t> mModuleBases;
+    mutable std::vector<MemRegion> mMemoryMap;
+    mutable bool mMapDirty = false;
 
     mutable std::mutex mBreakpointMutex;
     std::set<uint64_t> mBreakpointAddresses;

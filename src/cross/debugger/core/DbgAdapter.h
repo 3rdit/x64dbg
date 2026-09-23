@@ -109,9 +109,11 @@ private:
     [[nodiscard]] REGDUMP readRegisters() const;
     void emitStoppedState(const QString & reason);
     void emitStoppedState(const QString & reason, const REGDUMP & dump);
+    void scheduleThreadRefresh();
 
     ElfBugDebugger* mDebugger = nullptr;
     duint mEntryPoint = 0;
+    std::atomic<bool> mThreadRefreshQueued{false};
 
     std::mutex mThreadNameMutex;
     QHash<pid_t, QString> mThreadNames;

@@ -252,6 +252,86 @@ TEST_CASE("MemRead hides breakpoint patches, MemReadRaw does not", "[breakpoint]
     dbg.JoinThread();
 }
 
+TEST_CASE("MemRead and MemWrite touch only the breakpoints inside their range", "[breakpoint]")
+{
+    using namespace ElfBug::test;
+    RecordingDebugger dbg;
+    const std::string path = FIXTURE("step_over_targets");
+    REQUIRE(dbg.Init(path.c_str()));
+
+    struct Bytes
+    {
+        std::optional<ElfBug::ptr> site;
+        std::uint8_t original[6] = {};
+        std::uint8_t guarded[8] = {};
+        std::uint8_t raw[6] = {};
+        std::uint8_t written[6] = {};
+        std::uint8_t after[6] = {};
+    };
+
+    std::promise<Bytes> promise;
+    auto future = promise.get_future();
+    dbg.OnSystemBreakpoint([&]
+    {
+        Bytes b;
+        b.site = ResolveRuntimeAddress(path, dbg.process()->pid, "so_call_site");
+        if(b.site)
+        {
+            auto* process = dbg.process();
+            const ElfBug::ptr first = *b.site - 1;
+            (void)process->MemRead(first, b.original, sizeof(b.original));
+            // Just before, first, last and just past the 4 bytes accessed at first + 1.
+            const ElfBug::ptr offsets[] = {0, 1, 4, 5};
+            for(const ElfBug::ptr offset : offsets)
+                process->SetBreakpoint(first + offset, false, ElfBug::SoftwareType::ShortInt3);
+
+            std::memset(b.guarded, 0x5A, sizeof(b.guarded));
+            (void)process->MemRead(first + 1, b.guarded + 2, 4);
+            (void)process->MemReadRaw(first, b.raw, sizeof(b.raw));
+
+            std::uint8_t replacement[4] = {0x90, 0x90, 0x90, 0x90};
+            (void)process->MemWrite(first + 1, replacement, sizeof(replacement));
+            (void)process->MemReadRaw(first, b.written, sizeof(b.written));
+            for(const ElfBug::ptr offset : offsets)
+                process->DeleteBreakpoint(first + offset);
+            (void)process->MemReadRaw(first, b.after, sizeof(b.after));
+            (void)process->MemWriteRaw(first, b.original, sizeof(b.original));
+        }
+        promise.set_value(b);
+    });
+
+    dbg.StartOnThread();
+    dbg.WaitForSystemBreakpoint();
+    const auto b = future.get();
+    REQUIRE(b.site.has_value());
+
+    CHECK(b.guarded[0] == 0x5A);
+    CHECK(b.guarded[1] == 0x5A);
+    CHECK(std::equal(b.original + 1, b.original + 5, b.guarded + 2));
+    CHECK(b.guarded[6] == 0x5A);
+    CHECK(b.guarded[7] == 0x5A);
+
+    CHECK(b.raw[0] == 0xCC);
+    CHECK(b.raw[1] == 0xCC);
+    CHECK(b.raw[4] == 0xCC);
+    CHECK(b.raw[5] == 0xCC);
+    CHECK(std::equal(b.original + 2, b.original + 4, b.raw + 2));
+
+    CHECK(b.written[0] == 0xCC);
+    CHECK(b.written[1] == 0xCC);
+    CHECK(b.written[2] == 0x90);
+    CHECK(b.written[3] == 0x90);
+    CHECK(b.written[4] == 0xCC);
+    CHECK(b.written[5] == 0xCC);
+
+    const std::uint8_t expected[6] = {b.original[0], 0x90, 0x90, 0x90, 0x90, b.original[5]};
+    CHECK(std::equal(expected, expected + 6, b.after));
+
+    dbg.Continue();
+    dbg.WaitForExit();
+    dbg.JoinThread();
+}
+
 TEST_CASE("An execve reseats breakpoint records onto the new image", "[stepover][exec]")
 {
     using namespace ElfBug::test;

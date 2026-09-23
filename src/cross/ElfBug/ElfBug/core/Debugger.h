@@ -30,6 +30,8 @@ namespace ElfBug
     constexpr long kLaunchPtraceOptions = kPtraceOptions | PTRACE_O_EXITKILL;
 
     constexpr auto kPollInterval = std::chrono::milliseconds(1);
+    constexpr auto kStopPollMin = std::chrono::microseconds(10);
+    constexpr int kStopPollYields = 32;
     constexpr auto kStopWaitTimeout = std::chrono::milliseconds(250);
 
     std::string AttachErrorMessage(pid_t pid, int err, int ptraceScope, bool isOurChild);

@@ -109,13 +109,13 @@ namespace ElfBug
                     continue;
             }
 
-            if(!thread->registers.Read())
-                continue;
-
             // A thread frozen just before the byte has not hit it; stepping it off would
             // skip the hit. Only a rewound thread owes a step.
+            if(!thread->AtBreakpoint() || !thread->registers.Read())
+                continue;
+
             const ptr rip = thread->registers.Gip();
-            if(!thread->AtBreakpoint() || !mProcess->HasBreakpoint(rip))
+            if(!mProcess->HasBreakpoint(rip))
                 continue;
 
             Thread* previous = nullptr;

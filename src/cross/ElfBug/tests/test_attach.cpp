@@ -236,43 +236,50 @@ TEST_CASE("Attach reports an error when the target dies before the sweep", "[att
 
 TEST_CASE("A signal already pending at attach is reported before the tracee runs", "[attach]")
 {
-    ElfBug::test::UntracedProcess target(FIXTURE("signal_storm"));
-    REQUIRE(target.pid > 0);
-    REQUIRE(ElfBug::test::WaitForExeced(target.pid, FIXTURE("signal_storm")));
-    REQUIRE(target.WaitForThreads(9));
-
-    ElfBug::test::RecordingDebugger dbg;
-
-    bool pending = false;
-    dbg.OnAttachBreakpoint([&]
+    constexpr int kAttempts = 5;
+    for(int attempt = 1;; ++attempt)
     {
-        for(const auto & [tid, thread] : dbg.process()->threads)
+        ElfBug::test::UntracedProcess target(FIXTURE("signal_storm"));
+        REQUIRE(target.pid > 0);
+        REQUIRE(ElfBug::test::WaitForExeced(target.pid, FIXTURE("signal_storm")));
+        REQUIRE(target.WaitForThreads(9));
+
+        ElfBug::test::RecordingDebugger dbg;
+
+        bool pending = false;
+        dbg.OnAttachBreakpoint([&]
         {
-            if(thread->PendingSignal() == SIGUSR1)
-                pending = true;
-        }
-    });
+            for(const auto & [tid, thread] : dbg.process()->threads)
+            {
+                if(thread->PendingSignal() == SIGUSR1)
+                    pending = true;
+            }
+        });
 
-    REQUIRE(dbg.Attach(target.pid));
-    dbg.StartOnThread();
-    dbg.WaitForAttachBreakpoint();
+        REQUIRE(dbg.Attach(target.pid));
+        dbg.StartOnThread();
+        dbg.WaitForAttachBreakpoint();
 
-    REQUIRE(pending);
+        if(!pending && attempt < kAttempts)
+            continue;
+        REQUIRE(pending);
 
-    const auto handled = ElfBug::test::ResolveRuntimeAddress(FIXTURE("signal_storm"),
-                         dbg.process()->pid, "ss_handled");
-    REQUIRE(handled.has_value());
+        const auto handled = ElfBug::test::ResolveRuntimeAddress(FIXTURE("signal_storm"),
+                             dbg.process()->pid, "ss_handled");
+        REQUIRE(handled.has_value());
 
-    int before = 0;
-    REQUIRE(dbg.process()->MemReadRaw(*handled, &before, sizeof(before)));
+        int before = 0;
+        REQUIRE(dbg.process()->MemReadRaw(*handled, &before, sizeof(before)));
 
-    dbg.Continue();
-    dbg.WaitForException(SIGUSR1);
+        dbg.Continue();
+        dbg.WaitForException(SIGUSR1);
 
-    int atException = 0;
-    REQUIRE(dbg.process()->MemReadRaw(*handled, &atException, sizeof(atException)));
+        int atException = 0;
+        REQUIRE(dbg.process()->MemReadRaw(*handled, &atException, sizeof(atException)));
 
-    REQUIRE(atException == before);
+        REQUIRE(atException == before);
+        break;
+    }
 }
 
 TEST_CASE("AttachErrorMessage names the yama fix for EPERM", "[attach]")

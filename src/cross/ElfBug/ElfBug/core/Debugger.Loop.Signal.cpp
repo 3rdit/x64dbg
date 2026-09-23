@@ -4,6 +4,7 @@
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -81,7 +82,8 @@ namespace ElfBug
     WaitResult WaitForStop(const pid_t tid, int & status)
     {
         const auto deadline = std::chrono::steady_clock::now() + kStopWaitTimeout;
-        for(;;)
+        std::chrono::microseconds backoff = kStopPollMin;
+        for(int attempt = 0;; ++attempt)
         {
             const pid_t waited = waitpid(tid, &status, __WALL | WNOHANG);
             if(waited == tid)
@@ -92,7 +94,13 @@ namespace ElfBug
                 return WaitResult::Gone;
             if(std::chrono::steady_clock::now() >= deadline)
                 return WaitResult::TimedOut;
-            std::this_thread::sleep_for(kPollInterval);
+            if(attempt < kStopPollYields)
+            {
+                std::this_thread::yield();
+                continue;
+            }
+            std::this_thread::sleep_for(backoff);
+            backoff = std::min<std::chrono::microseconds>(backoff * 2, kPollInterval);
         }
     }
 

@@ -4,12 +4,14 @@
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <thread>
@@ -32,13 +34,21 @@ namespace ElfBug
         // 'T' is group-stop, 't' is any ptrace-stop. Only the first outlives a detach.
         char processState(const pid_t pid)
         {
-            std::ifstream file("/proc/" + std::to_string(pid) + "/stat");
-            std::string line;
-            std::getline(file, line);
-            const auto lastParen = line.rfind(')');
-            if(lastParen == std::string::npos || lastParen + 2 >= line.size())
+            char path[64];
+            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+            const int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if(fd == -1)
                 return '?';
-            return line[lastParen + 2];
+            char buffer[512];
+            const ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+            close(fd);
+            if(n <= 0)
+                return '?';
+            buffer[n] = '\0';
+            const char* lastParen = strrchr(buffer, ')');
+            if(!lastParen || lastParen + 2 >= buffer + n)
+                return '?';
+            return lastParen[2];
         }
 
         void collectClonedChild(const pid_t parent, const int status, std::vector<pid_t> & clones)

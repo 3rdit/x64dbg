@@ -1,4 +1,6 @@
 #include "TestSupport.h"
+#include <cstring>
+#include <fstream>
 #include <functional>
 #include <set>
 #include <mutex>
@@ -25,7 +27,8 @@ namespace
         std::optional<int> exitCode;
         std::vector<pid_t> createdTids;
         std::vector<pid_t> exitedTids;
-        std::function<void()> atSystemBreakpoint;
+        ElfBugDebugger* dbg = nullptr;
+        std::function<void(ElfBugDebugger*)> atSystemBreakpoint;
 
         template<class Pred>
         bool WaitFor(Pred pred, const std::chrono::milliseconds timeout = std::chrono::seconds(5))
@@ -56,7 +59,7 @@ namespace
         {
             auto* ev = static_cast<ApiEvents*>(userdata);
             if(ev->atSystemBreakpoint)
-                ev->atSystemBreakpoint();
+                ev->atSystemBreakpoint(ev->dbg);
             std::lock_guard lock(ev->mutex);
             ev->systemBreakpoint = true;
             ev->cv.notify_all();
@@ -121,12 +124,13 @@ namespace
         ElfBugDebugger* dbg = nullptr;
         std::thread loop;
 
-        explicit ApiSession(std::string fixturePath, std::function<void()> atSystemBreakpoint = {})
+        explicit ApiSession(std::string fixturePath, std::function<void(ElfBugDebugger*)> atSystemBreakpoint = {})
             : path(std::move(fixturePath))
         {
             events.atSystemBreakpoint = std::move(atSystemBreakpoint);
             const ElfBugCallbacks cb = MakeApiCallbacks(events);
             dbg = ElfBugCreate(&cb);
+            events.dbg = dbg;
             if(dbg && ElfBugInit(dbg, path.c_str()))
                 loop = std::thread([this] { ElfBugStart(dbg); });
         }
@@ -213,6 +217,39 @@ TEST_CASE("C API reports a signal stop with the faulting registers", "[api][exce
     ElfBugContinue(s.dbg);
     REQUIRE(s.WaitForExit());
     REQUIRE(*s.events.exitCode == -SIGSEGV);
+}
+
+TEST_CASE("Module lookups report the lowest mapping of the image", "[api][memory]")
+{
+    ApiSession s(FIXTURE("segfault"));
+    REQUIRE(s.Started());
+    REQUIRE(s.WaitForSystemBreakpoint());
+    const auto site = s.Resolve("sf_fault_site");
+    REQUIRE(site.has_value());
+
+    const pid_t pid = ElfBugGetPid(s.dbg);
+    char exe[4096] = {};
+    const std::string link = "/proc/" + std::to_string(pid) + "/exe";
+    REQUIRE(readlink(link.c_str(), exe, sizeof(exe) - 1) > 0);
+
+    uint64_t lowest = UINT64_MAX;
+    std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
+    for(std::string line; std::getline(maps, line);)
+    {
+        if(line.size() > strlen(exe) && line.compare(line.size() - strlen(exe), strlen(exe), exe) == 0)
+            lowest = std::min<uint64_t>(lowest, std::stoull(line, nullptr, 16));
+    }
+    REQUIRE(lowest != UINT64_MAX);
+    REQUIRE(lowest < *site);
+
+    uint64_t base = 0;
+    REQUIRE(ElfBugModBaseFromAddr(s.dbg, *site, &base));
+    REQUIRE(base == lowest);
+
+    char name[64] = {};
+    REQUIRE(ElfBugModNameFromAddr(s.dbg, *site, name, sizeof(name), false));
+    REQUIRE(std::string(name) == "segfault");
+    REQUIRE_FALSE(ElfBugModBaseFromAddr(s.dbg, 0x10, &base));
 }
 
 TEST_CASE("C API arms a breakpoint queued right before Continue", "[api][breakpoint]")
@@ -638,17 +675,15 @@ TEST_CASE("ElfBugSetRegister works from inside a stop callback", "[api][register
 {
     using namespace ElfBug::test;
     constexpr uint64_t kValue = 0x1234567890abcdefULL;
-    ElfBugDebugger* dbg = nullptr;
     bool ok = false;
     std::chrono::steady_clock::duration took{};
 
-    ApiSession s(FIXTURE("run_endlessly"), [&]
+    ApiSession s(FIXTURE("run_endlessly"), [&](ElfBugDebugger* dbg)
     {
         const auto start = std::chrono::steady_clock::now();
         ok = ElfBugSetRegister(dbg, "r15", kValue);
         took = std::chrono::steady_clock::now() - start;
     });
-    dbg = s.dbg;
     REQUIRE(s.Started());
     REQUIRE(s.WaitForSystemBreakpoint());
 
