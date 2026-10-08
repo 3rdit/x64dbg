@@ -31,10 +31,6 @@ CPUStack::CPUStack(Architecture* architecture, DbgAdapter* adapter, QWidget* par
     connect(mAdapter, &DbgAdapter::processCreated,
             this, &CPUStack::onProcessStarted,
             Qt::QueuedConnection);
-
-    connect(mAdapter, &DbgAdapter::sessionEnded,
-            this, &CPUStack::onSessionEnded,
-            Qt::QueuedConnection);
 }
 
 void CPUStack::setupColumns()

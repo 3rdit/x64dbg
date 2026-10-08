@@ -1,0 +1,679 @@
+#include "TestSupport.h"
+#include <ElfBug/elf/ElfImageCache.h>
+#include <ElfBug/process/MemoryMap.h>
+#include <ElfBug/process/TraceeMemory.h>
+#include <ElfBug/types/Utf8.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
+#include <algorithm>
+#include <array>
+#include <string>
+#include <vector>
+#include "targets/TargetUtil.h"
+
+namespace
+{
+    using namespace ElfBug;
+    using namespace ElfBug::test;
+
+    bool WriteTraceeInt(const pid_t pid, const ptr address, int value)
+    {
+        iovec local{&value, sizeof(value)};
+        iovec remote{reinterpret_cast<void*>(address), sizeof(value)};
+        return process_vm_writev(pid, &local, 1, &remote, 1, 0) == static_cast<ssize_t>(sizeof(value));
+    }
+
+    struct Mapping
+    {
+        uint64_t start = 0;
+        std::string perms;
+    };
+
+    // Every maps entry whose path ends with suffix, lowest first.
+    std::vector<Mapping> MappingsOf(const pid_t pid, const std::string_view suffix)
+    {
+        std::vector<Mapping> mappings;
+        const std::string maps = procfs::ReadFile(procfs::Path(pid, "maps"));
+        for(const std::string_view line : procfs::Split(maps, '\n'))
+        {
+            const auto entry = procfs::ParseMapsLine(line);
+            if(entry && entry->path.ends_with(suffix))
+                mappings.push_back({entry->start, std::string(entry->perms)});
+        }
+        return mappings;
+    }
+
+    const MemoryRegion & RequireRegion(const MemoryMap & map, const uint64_t address)
+    {
+        const MemoryRegion* region = map.FindRegion(address);
+        REQUIRE(region);
+        return *region;
+    }
+
+    const MemoryModule & RequireModule(const MemoryMap & map, const uint64_t address)
+    {
+        const MemoryModule* module = map.FindModule(address);
+        REQUIRE(module);
+        return *module;
+    }
+
+    bool HasImageSection(const MemoryModule* module, const std::string & name)
+    {
+        return module && module->image && HasSection(*module->image, name);
+    }
+
+    // mem_map_target run without a tracer, once its worker has published.
+    class MapTarget
+    {
+    public:
+        explicit MapTarget(std::vector<std::string> environment = {})
+            : mProcess(mPath, std::move(environment))
+        {
+            REQUIRE(WaitForExeced(Pid(), mPath));
+            const ptr workerTid = Symbol("mm_worker_tid");
+            REQUIRE(WaitUntil([&] { return ReadTraceeValue<int>(Pid(), workerTid).value_or(0) != 0; }));
+        }
+
+        [[nodiscard]] pid_t Pid() const { return mProcess.pid; }
+        [[nodiscard]] const std::string & Path() const { return mPath; }
+
+        [[nodiscard]] ptr Symbol(const std::string & name) const
+        {
+            const auto address = ResolveRuntimeAddress(mPath, Pid(), name);
+            REQUIRE(address.has_value());
+            return *address;
+        }
+
+        // From the aux vector, so readelf-based checks don't take it from the map under test.
+        [[nodiscard]] ptr Bias() const
+        {
+            const auto bias = GetExecLoadBias(Pid(), mPath);
+            REQUIRE(bias.has_value());
+            return *bias;
+        }
+
+        template<typename T>
+        [[nodiscard]] T Published(const std::string & name) const
+        {
+            const auto value = ReadSymbol<T>(Pid(), mPath, name);
+            REQUIRE(value.has_value());
+            return *value;
+        }
+
+        [[nodiscard]] std::vector<ThreadPointers> Threads() const
+        {
+            return
+            {
+                {Pid(), Published<uintptr_t>("mm_main_stack"), 0},
+                {Published<int>("mm_worker_tid"), Published<uintptr_t>("mm_worker_stack"), Published<uintptr_t>("mm_worker_tcb")},
+            };
+        }
+
+        // Rebuilds and attaches images the way the API's resolveImages does.
+        void Build(MemoryMap & map)
+        {
+            map.Rebuild(Pid(), Threads());
+            map.AttachImages(mImages.Load(Pid(), mImages.Generation(), map.PendingImages()));
+        }
+
+        // Writes request to one of the fixture's flags and returns its answer.
+        int Ask(const std::string & flag, const int request) const
+        {
+            const ptr address = Symbol(flag);
+            REQUIRE(WriteTraceeInt(Pid(), address, request));
+            REQUIRE(WaitUntil([&] { return ReadTraceeValue<int>(Pid(), address) != request; }));
+            const auto answer = ReadTraceeValue<int>(Pid(), address);
+            REQUIRE(answer.has_value());
+            return *answer;
+        }
+
+        void Request(const std::string & flag, const int request) const
+        {
+            REQUIRE(Ask(flag, request) == request + 1);
+        }
+
+    private:
+        std::string mPath = FIXTURE("mem_map_target");
+        UntracedProcess mProcess;
+        ElfImageCache mImages;
+    };
+}
+
+TEST_CASE("ReadTraceeMemory reads a process by pid", "[memorymap]")
+{
+    const std::array<char, 8> source{'e', 'l', 'f', 'b', 'u', 'g', '!', '\0'};
+    std::array<char, 8> copy{};
+    const auto address = reinterpret_cast<ptr>(source.data());
+    REQUIRE(ReadTraceeMemory(getpid(), address, copy.data(), copy.size()) == static_cast<ssize_t>(copy.size()));
+    REQUIRE(copy == source);
+    REQUIRE(ReadTraceeMemory(getpid(), 0x10, copy.data(), copy.size()) == -1);
+}
+
+TEST_CASE("ReadTraceeMemory reads a page with no access", "[memorymap]")
+{
+    void* page = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(page != MAP_FAILED);
+    const std::array<char, 8> source{'e', 'l', 'f', 'b', 'u', 'g', '!', '\0'};
+    std::memcpy(page, source.data(), source.size());
+    REQUIRE(mprotect(page, 4096, PROT_NONE) == 0);
+    std::array<char, 8> copy{};
+    const ssize_t read = ReadTraceeMemory(getpid(), reinterpret_cast<ptr>(page), copy.data(), copy.size());
+    munmap(page, 4096);
+    REQUIRE(read == static_cast<ssize_t>(copy.size()));
+    REQUIRE(copy == source);
+}
+
+TEST_CASE("Utf8Prefix never ends inside a character", "[memorymap]")
+{
+    const std::string text = "ab\xc3\xa9";
+    REQUIRE(Utf8Prefix(text, 10) == text);
+    REQUIRE(Utf8Prefix(text, 4) == text);
+    REQUIRE(Utf8Prefix(text, 3) == "ab");
+    REQUIRE(Utf8Prefix(text, 2) == "ab");
+    REQUIRE(Utf8Prefix(text, 0).empty());
+
+    const std::string invalid = "ab" + std::string(6, '\x80');
+    REQUIRE(Utf8Prefix(invalid, 7).size() == 4);
+}
+
+TEST_CASE("MemoryMap groups the executable with its anonymous .bss tail", "[memorymap]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+
+    const ptr code = target.Symbol("mm_code");
+    const ptr bssEnd = target.Symbol("mm_bss") + kMemMapBssSize - 1;
+    const MemoryModule* exe = map.FindModule(code);
+    REQUIRE(exe);
+    REQUIRE(exe->path == target.Path());
+    REQUIRE(exe->base == GetExecBase(target.Pid(), target.Path()));
+    REQUIRE(RequireRegion(map, code).type == RegionType::Image);
+
+    const MemoryRegion & tail = RequireRegion(map, bssEnd);
+    REQUIRE_FALSE(tail.file.Known());
+    REQUIRE(tail.type == RegionType::Image);
+    REQUIRE(map.FindModule(bssEnd) == exe);
+}
+
+TEST_CASE("MemoryMap marks the executable User and libc System", "[memorymap]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+
+    REQUIRE(RequireModule(map, target.Symbol("mm_code")).party == Party::User);
+
+    const auto libc = MappingsOf(target.Pid(), "/libc.so.6");
+    REQUIRE_FALSE(libc.empty());
+    const MemoryModule* libcModule = map.FindModule(libc.front().start);
+    REQUIRE(libcModule);
+    REQUIRE(libcModule->party == Party::System);
+    REQUIRE(HasImageSection(libcModule, ".text"));
+}
+
+TEST_CASE("MemoryMap keeps data files and anonymous memory out of modules", "[memorymap]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+
+    const MemoryRegion & reserved = RequireRegion(map, target.Published<uintptr_t>("mm_reserved"));
+    REQUIRE(reserved.perms == "---p");
+    REQUIRE(reserved.type == RegionType::Private);
+    REQUIRE_FALSE(reserved.module);
+
+    const MemoryRegion & shared = RequireRegion(map, target.Published<uintptr_t>("mm_shared"));
+    REQUIRE(shared.type == RegionType::Mapped);
+    REQUIRE_FALSE(shared.module);
+
+    const MemoryRegion & file = RequireRegion(map, target.Published<uintptr_t>("mm_file"));
+    REQUIRE(file.type == RegionType::Mapped);
+    REQUIRE_FALSE(file.module);
+
+    REQUIRE(map.FindModule(target.Published<uintptr_t>("mm_heap")) == nullptr);
+}
+
+TEST_CASE("MemoryMap loads section names only through AttachImages", "[memorymap]")
+{
+    MapTarget target;
+    MemoryMap map;
+    map.Rebuild(target.Pid(), target.Threads());
+    const ptr code = target.Symbol("mm_code");
+    const MemoryModule* exe = map.FindModule(code);
+    REQUIRE(exe);
+    REQUIRE(exe->mainProgram);
+    REQUIRE_FALSE(exe->imageResolved);
+    REQUIRE_FALSE(exe->image);
+
+    const auto pending = map.PendingImages();
+    const auto isExe = [&](const ImageRequest & request)
+    {
+        return request.file == exe->file;
+    };
+    REQUIRE(std::count_if(pending.begin(), pending.end(), isExe) == 1);
+    REQUIRE(std::count_if(pending.begin(), pending.end(), [](const ImageRequest & request) { return request.mainProgram; }) == 1);
+    const auto request = std::find_if(pending.begin(), pending.end(), isExe);
+    REQUIRE(request->mainProgram);
+    REQUIRE(request->path == target.Path());
+    REQUIRE(request->start == exe->base);
+
+    ElfImageCache cache;
+    map.AttachImages(cache.Load(target.Pid(), cache.Generation(), pending));
+    REQUIRE(HasImageSection(map.FindModule(code), ".text"));
+    REQUIRE(map.PendingImages().empty());
+}
+
+TEST_CASE("MemoryMap shows no sections from a file whose headers differ from memory", "[memorymap]")
+{
+    MapTarget target;
+    MemoryMap map;
+    map.Rebuild(target.Pid(), target.Threads());
+    const ptr code = target.Symbol("mm_code");
+    const ImageId file = RequireModule(map, code).file;
+
+    auto parsed = ParseBytes(ReadFileBytes(FIXTURE("hello_elfbug")));
+    REQUIRE(parsed.has_value());
+    const auto impostor = std::make_shared<const ElfImage>(std::move(*parsed));
+
+    SECTION("a file found by path is checked against memory")
+    {
+        map.AttachImages({{file, impostor, false}});
+        REQUIRE(RequireModule(map, code).imageResolved);
+        REQUIRE_FALSE(RequireModule(map, code).image);
+    }
+    SECTION("the mapped inode itself is trusted")
+    {
+        map.AttachImages({{file, impostor, true}});
+        REQUIRE(RequireModule(map, code).image == impostor);
+    }
+}
+
+TEST_CASE("MemoryMap carries modules over between rebuilds", "[memorymap]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+    const ptr code = target.Symbol("mm_code");
+    const ElfImage* image = RequireModule(map, code).image.get();
+    REQUIRE(image);
+
+    map.Rebuild(target.Pid(), target.Threads());
+    REQUIRE(RequireModule(map, code).image.get() == image);
+    REQUIRE(map.PendingImages().empty());
+}
+
+TEST_CASE("MemoryMap puts loader holes inside their library and drops it when unloaded", "[memorymap]")
+{
+    MapTarget target;
+    target.Request("mm_load_gap", 1);
+    MemoryMap map;
+    target.Build(map);
+
+    const auto mappings = MappingsOf(target.Pid(), "/libmm_gap.so");
+    REQUIRE_FALSE(mappings.empty());
+    const uint64_t base = mappings.front().start;
+    const auto hole = std::find_if(mappings.begin(), mappings.end(), [](const Mapping & mapping)
+    {
+        return mapping.perms == "---p";
+    });
+    REQUIRE(hole != mappings.end());
+
+    const MemoryModule* gap = map.FindModule(base);
+    REQUIRE(gap);
+    REQUIRE(gap->base == base);
+    REQUIRE(HasImageSection(gap, ".text"));
+    REQUIRE(map.FindModule(hole->start) == gap);
+    REQUIRE(RequireRegion(map, hole->start).type == RegionType::Image);
+    for(const bool sectionView : {false, true})
+    {
+        CAPTURE(sectionView);
+        const auto pages = map.Pages(sectionView);
+        const MemoryPage & page = RequirePage(pages, hole->start);
+        REQUIRE(page.info == "Reserved");
+        REQUIRE(page.type == RegionType::Image);
+        REQUIRE(page.moduleBase == base);
+    }
+
+    target.Request("mm_load_gap", 4);
+    map.Rebuild(target.Pid(), target.Threads());
+    REQUIRE(MappingsOf(target.Pid(), "/libmm_gap.so").empty());
+    REQUIRE(map.FindModule(base) == nullptr);
+}
+
+TEST_CASE("MemoryMap does not mistake a whole-file mapping of an ELF for a module", "[memorymap]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+
+    for(const char* name : {"mm_self_image", "mm_self_exec"})
+    {
+        CAPTURE(name);
+        const uintptr_t address = target.Published<uintptr_t>(name);
+        REQUIRE(address != 0);
+        REQUIRE(map.FindModule(address) == nullptr);
+        REQUIRE(RequireRegion(map, address).type == RegionType::Mapped);
+    }
+
+    const auto pages = map.Pages(false);
+    const auto headers = std::count_if(pages.begin(), pages.end(), [](const MemoryPage & page)
+    {
+        return page.base == page.moduleBase && page.info.starts_with("mem_map_target");
+    });
+    REQUIRE(headers == 1);
+}
+
+TEST_CASE("MemoryMap takes anonymous memory only for an image's code", "[memorymap]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+
+    const uintptr_t phantom = target.Published<uintptr_t>("mm_phantom");
+    REQUIRE(phantom != 0);
+    REQUIRE(map.FindModule(phantom) == nullptr);
+    REQUIRE(map.FindModule(phantom + 0x10000) == nullptr);
+    REQUIRE(RequireRegion(map, phantom).type == RegionType::Mapped);
+    REQUIRE(RequireRegion(map, phantom + 0x10000).type == RegionType::Private);
+}
+
+TEST_CASE("MemoryMap keeps code moved onto anonymous memory in its module across a gap", "[memorymap]")
+{
+    const std::string path = FIXTURE("huge_text_target");
+    UntracedProcess process(path);
+    REQUIRE(WaitForExeced(process.pid, path));
+    const auto remapped = ResolveRuntimeAddress(path, process.pid, "ht_remapped");
+    REQUIRE(remapped.has_value());
+    int state = 0;
+    REQUIRE(WaitUntil([&]
+    {
+        state = ReadTraceeValue<int>(process.pid, *remapped).value_or(0);
+        return state != 0;
+    }));
+    if(state != 1)
+        SKIP("the fixture could not move its code");
+    const auto code = ResolveRuntimeAddress(path, process.pid, "ht_code");
+    REQUIRE(code.has_value());
+
+    MemoryMap map;
+    map.Rebuild(process.pid, {});
+    const MemoryRegion & moved = RequireRegion(map, *code);
+    REQUIRE_FALSE(moved.file.Known());
+    REQUIRE(map.FindRegion(moved.start - 1) == nullptr);
+    const MemoryModule* exe = map.FindModule(*code);
+    REQUIRE(exe);
+    REQUIRE(exe->path == path);
+    REQUIRE(moved.type == RegionType::Image);
+}
+
+TEST_CASE("MemoryMap ends a module's anonymous memory at the first gap", "[memorymap]")
+{
+    MapTarget target;
+    target.Request("mm_punch_bss", 1);
+    MemoryMap map;
+    target.Build(map);
+
+    const MemoryModule* exe = map.FindModule(target.Symbol("mm_code"));
+    REQUIRE(exe);
+    REQUIRE(map.FindModule(target.Symbol("mm_bss")) == exe);
+    const ptr bssEnd = target.Symbol("mm_bss") + kMemMapBssSize - 1;
+    REQUIRE(map.FindModule(bssEnd) == nullptr);
+    REQUIRE(RequireRegion(map, bssEnd).type == RegionType::Private);
+}
+
+TEST_CASE("MemoryMap leaves memory the kernel merged onto a .bss tail out of the module", "[memorymap]")
+{
+    MapTarget target;
+    if(target.Ask("mm_extend_bss", 1) != 2)
+        SKIP("nothing could be mapped right after .bss");
+    MemoryMap map;
+    target.Build(map);
+
+    const ptr bssEnd = target.Symbol("mm_bss") + kMemMapBssSize - 1;
+    const uintptr_t extension = target.Published<uintptr_t>("mm_extension");
+    const std::string maps = procfs::ReadFile(procfs::Path(target.Pid(), "maps"));
+    const auto lines = procfs::Split(maps, '\n');
+    const bool merged = std::any_of(lines.begin(), lines.end(), [&](const std::string_view line)
+    {
+        const auto entry = procfs::ParseMapsLine(line);
+        return entry && entry->start <= bssEnd && entry->end > extension;
+    });
+    if(!merged)
+        SKIP("the kernel kept the mapping apart from .bss");
+
+    const MemoryModule* exe = map.FindModule(target.Symbol("mm_code"));
+    REQUIRE(exe);
+    REQUIRE(map.FindModule(bssEnd) == exe);
+    REQUIRE(map.FindModule(extension) == nullptr);
+    const MemoryRegion & rest = RequireRegion(map, extension);
+    REQUIRE(rest.type == RegionType::Private);
+    REQUIRE(rest.start == RequireRegion(map, bssEnd).end);
+}
+
+TEST_CASE("MemoryMap joins a .bss tail that glibc names with decorate_maps", "[memorymap]")
+{
+    MapTarget target({"GLIBC_TUNABLES=glibc.mem.decorate_maps=1"});
+    MemoryMap map;
+    target.Build(map);
+
+    const auto tails = MappingsOf(target.Pid(), "/libc.so.6]");
+    if(tails.empty())
+        SKIP("this glibc does not name .bss tails");
+    const uint64_t tail = tails.front().start;
+    const MemoryModule* libc = map.FindModule(tail);
+    REQUIRE(libc);
+    REQUIRE(libc->path.ends_with("/libc.so.6"));
+    REQUIRE(RequireRegion(map, tail).type == RegionType::Image);
+}
+
+TEST_CASE("MemoryMap detects a library with no executable mapping", "[memorymap]")
+{
+    MapTarget target;
+    target.Request("mm_load_data", 1);
+    MemoryMap map;
+    target.Build(map);
+
+    const auto mappings = MappingsOf(target.Pid(), "/libmm_data.so");
+    REQUIRE(mappings.size() >= 2);
+    REQUIRE(std::none_of(mappings.begin(), mappings.end(), [](const Mapping & mapping)
+    {
+        return mapping.perms[2] == 'x';
+    }));
+
+    const MemoryModule & data = RequireModule(map, mappings.front().start);
+    REQUIRE(data.base == mappings.front().start);
+    REQUIRE(HasImageSection(&data, ".rodata"));
+    for(const auto & mapping : mappings)
+        REQUIRE(map.FindModule(mapping.start) == &data);
+}
+
+TEST_CASE("Region view names the sections in each module region", "[memorymap][pages]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+    const auto pages = map.Pages(false);
+    const ptr code = target.Symbol("mm_code");
+    const uint64_t exeBase = RequireModule(map, code).base;
+
+    const auto sections = ReadImageSections(target.Path());
+    const uint64_t bias = target.Bias();
+    const auto expectedInfo = [&](const MemoryPage & page)
+    {
+        std::string info = page.base == exeBase ? "mem_map_target" : "";
+        for(const auto & section : sections)
+        {
+            const uint64_t start = bias + section.address;
+            if(start + section.size <= page.base || start >= page.base + page.size)
+                continue;
+            if(!info.empty())
+                info += ",";
+            info += " \"" + section.name + "\"";
+        }
+        return info;
+    };
+
+    const MemoryPage & codePage = RequirePage(pages, code);
+    REQUIRE(codePage.info == expectedInfo(codePage));
+    REQUIRE(codePage.section == ".text");
+
+    const MemoryPage & headerPage = RequirePage(pages, exeBase);
+    REQUIRE(headerPage.info == expectedInfo(headerPage));
+    REQUIRE(RequirePage(pages, target.Symbol("mm_data")).info.find("\".data\"") != std::string::npos);
+    REQUIRE(RequirePage(pages, target.Symbol("mm_bss") + kMemMapBssSize - 1).info.find("\".bss\"") != std::string::npos);
+}
+
+TEST_CASE("Section view gives each section its own rows", "[memorymap][pages]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+    const auto pages = map.Pages(true);
+    const ptr code = target.Symbol("mm_code");
+
+    const MemoryPage & codePage = RequirePage(pages, code);
+    REQUIRE(codePage.info == " \".text\"");
+    REQUIRE(codePage.section == ".text");
+
+    const MemoryPage & header = RequirePage(pages, RequireModule(map, code).base);
+    REQUIRE(header.info == "mem_map_target");
+    REQUIRE(header.section.empty());
+}
+
+TEST_CASE("Section view lists every byte of region view exactly once", "[memorymap][pages]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+    const auto regions = map.Pages(false);
+    const auto pieces = map.Pages(true);
+
+    size_t next = 0;
+    for(const auto & region : regions)
+    {
+        CAPTURE(region.base, region.info);
+        uint64_t cursor = region.base;
+        while(cursor < region.base + region.size)
+        {
+            REQUIRE(next < pieces.size());
+            const MemoryPage & piece = pieces[next++];
+            REQUIRE(piece.base == cursor);
+            REQUIRE(piece.size > 0);
+            REQUIRE(piece.perms == region.perms);
+            REQUIRE(piece.moduleBase == region.moduleBase);
+            cursor += piece.size;
+        }
+        REQUIRE(cursor == region.base + region.size);
+    }
+    REQUIRE(next == pieces.size());
+}
+
+TEST_CASE("Section view attributes every byte of every section to it", "[memorymap][pages]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+    const uint64_t bias = target.Bias();
+    const auto pieces = map.Pages(true);
+
+    size_t checked = 0;
+    for(const auto & section : ReadImageSections(target.Path()))
+    {
+        CAPTURE(section.name);
+        const uint64_t start = bias + section.address;
+        const uint64_t end = start + section.size;
+        uint64_t covered = start;
+        for(const auto & piece : pieces)
+        {
+            if(piece.base + piece.size <= start || piece.base >= end)
+                continue;
+            REQUIRE(piece.section == section.name);
+            if(piece.base <= covered)
+                covered = std::max(covered, piece.base + piece.size);
+        }
+        REQUIRE(covered >= end);
+        ++checked;
+    }
+    REQUIRE(checked > 10);
+}
+
+TEST_CASE("Pages name every section however long the info gets", "[memorymap][pages]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+    const uint64_t bias = target.Bias();
+
+    std::vector<SectionInfo> longSections;
+    for(const auto & section : ReadImageSections(target.Path()))
+    {
+        if(section.name.starts_with(".mm_section_"))
+            longSections.push_back(section);
+    }
+    REQUIRE(longSections.size() == 17);
+
+    const auto regions = map.Pages(false);
+    const auto pieces = map.Pages(true);
+    for(const auto & section : longSections)
+    {
+        CAPTURE(section.name);
+        const uint64_t address = bias + section.address;
+        REQUIRE(RequirePage(regions, address).info.find("\"" + section.name + "\"") != std::string::npos);
+        REQUIRE(RequirePage(pieces, address).info == " \"" + section.name + "\"");
+    }
+}
+
+TEST_CASE("Pages show pseudo regions by their labels and no-access memory as Reserved", "[memorymap][pages]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+    const std::string pid = std::to_string(target.Pid());
+    const std::string tid = std::to_string(target.Published<int>("mm_worker_tid"));
+    const uintptr_t mainStack = target.Published<uintptr_t>("mm_main_stack");
+    const uintptr_t workerStack = target.Published<uintptr_t>("mm_worker_stack");
+
+    REQUIRE(RequireRegion(map, mainStack).name == "[stack]");
+    REQUIRE(&RequireRegion(map, target.Published<uintptr_t>("mm_worker_tcb")) == &RequireRegion(map, workerStack));
+    for(const bool sectionView : {false, true})
+    {
+        CAPTURE(sectionView);
+        const auto pages = map.Pages(sectionView);
+        REQUIRE(RequirePage(pages, target.Published<uintptr_t>("mm_heap")).info == "Heap");
+        REQUIRE(RequirePage(pages, mainStack).info == "Stack (" + pid + ")");
+        REQUIRE(RequirePage(pages, workerStack).info == "TLS (" + tid + "), Stack (" + tid + ")");
+        REQUIRE(RequirePage(pages, target.Published<uintptr_t>("mm_reserved")).info == "Reserved");
+    }
+}
+
+TEST_CASE("Pages keep the name of a named anonymous mapping", "[memorymap][pages]")
+{
+    MapTarget target;
+    if(target.Published<int>("mm_named_ok") == 0)
+        SKIP("the kernel has no PR_SET_VMA_ANON_NAME");
+    MemoryMap map;
+    target.Build(map);
+    REQUIRE(RequirePage(map.Pages(false), target.Published<uintptr_t>("mm_named")).info == "[anon:elfbug]");
+}
+
+TEST_CASE("Pages show the vdso as a System image with its own sections", "[memorymap][pages]")
+{
+    MapTarget target;
+    MemoryMap map;
+    target.Build(map);
+    const auto vdso = MappingsOf(target.Pid(), "[vdso]");
+    REQUIRE(vdso.size() == 1);
+
+    const auto regions = map.Pages(false);
+    const MemoryPage & header = RequirePage(regions, vdso.front().start);
+    REQUIRE(header.info.starts_with("[vdso]"));
+    REQUIRE(header.party == Party::System);
+    REQUIRE(header.type == RegionType::Image);
+
+    const auto pieces = map.Pages(true);
+    REQUIRE(std::any_of(pieces.begin(), pieces.end(), [&](const MemoryPage & piece)
+    {
+        return piece.moduleBase == vdso.front().start && piece.section == ".text";
+    }));
+}

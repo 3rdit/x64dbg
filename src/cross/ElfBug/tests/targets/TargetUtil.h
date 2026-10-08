@@ -1,8 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <ctime>
 
 constexpr int kCloneTrapRounds = 128;
+
+// mem_map_target's mm_bss, which spills past its file-backed page into the anonymous tail.
+constexpr size_t kMemMapBssSize = 64 * 1024;
 
 // Where segfault.cpp stores; unmapped with ASLR off.
 constexpr unsigned long kSegfaultAddress = 0xdead0000;

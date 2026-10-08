@@ -1,12 +1,18 @@
 #include "core/DbgAdapter.h"
 
+#include <StringUtil.h>
 #include <algorithm>
 #include <cassert>
 #include <csignal>
+#include <cstdio>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace
 {
+    constexpr duint kMemoryDumpChunkSize = 1024 * 1024;
+
     REGDUMP toRegDump(const ElfBugRegisters & regs)
     {
         REGDUMP dump{};
@@ -390,28 +396,148 @@ void DbgAdapter::emitStoppedState(const QString & reason)
 
 void DbgAdapter::emitStoppedState(const QString & reason, const REGDUMP & dump)
 {
-    QMetaObject::invokeMethod(&mWorker, [this] { ElfBugLoadMemoryMap(mDebugger); }, Qt::QueuedConnection);
     emit registersUpdated(dump);
     emit stopped(dump.regcontext.cip, reason + threadSuffix());
     scheduleThreadRefresh();
+    scheduleMemoryMapRefresh();
+}
+
+void DbgAdapter::scheduleRefresh(RefreshGate & gate, void (DbgAdapter::*refresh)())
+{
+    if(!gate.visible || gate.queued.exchange(true))
+        return;
+    QMetaObject::invokeMethod(&mWorker, [this, &gate, refresh]
+    {
+        gate.queued = false;
+        (this->*refresh)();
+    }, Qt::QueuedConnection);
 }
 
 void DbgAdapter::setThreadListVisible(const bool visible)
 {
-    mThreadListVisible = visible;
+    mThreadListGate.visible = visible;
     if(visible)
         scheduleThreadRefresh();
 }
 
 void DbgAdapter::scheduleThreadRefresh()
 {
-    if(!mThreadListVisible || mThreadRefreshQueued.exchange(true))
-        return;
-    QMetaObject::invokeMethod(&mWorker, [this]
+    scheduleRefresh(mThreadListGate, &DbgAdapter::refreshThreads);
+}
+
+struct DbgAdapter::DumpJob
+{
+    std::string path;
+    std::ofstream out;
+    duint start = 0;
+    duint size = 0;
+    duint done = 0;
+};
+
+void DbgAdapter::setMemoryMapVisible(const bool visible)
+{
+    mMemoryMapGate.visible = visible;
+    if(visible)
+        scheduleMemoryMapRefresh();
+}
+
+void DbgAdapter::setMemoryMapSectionView(const bool sectionView)
+{
+    mMemoryMapSectionView = sectionView;
+    scheduleMemoryMapRefresh();
+}
+
+void DbgAdapter::scheduleMemoryMapRefresh()
+{
+    scheduleRefresh(mMemoryMapGate, &DbgAdapter::refreshMemoryMap);
+}
+
+void DbgAdapter::refreshMemoryMap()
+{
+    const auto rows = ElfBugMemoryMap(mDebugger, mMemoryMapSectionView);
+    QVector<DbgMemoryPage> pages;
+    pages.reserve(static_cast<int>(rows.size()));
+    for(const auto & row : rows)
     {
-        mThreadRefreshQueued = false;
-        refreshThreads();
-    }, Qt::QueuedConnection);
+        DbgMemoryPage page;
+        page.base = row.base;
+        page.size = row.size;
+        page.moduleBase = row.module_base;
+        page.type = row.type;
+        page.party = row.party;
+        page.perms = QString::fromLatin1(row.perms);
+        page.section = QString::fromUtf8(row.section);
+        page.info = QString::fromUtf8(row.info);
+        pages.push_back(page);
+    }
+    emit memoryMapUpdated(pages);
+}
+
+void DbgAdapter::dumpMemory(const duint start, const duint size, const QString & path)
+{
+    auto job = std::make_shared<DumpJob>();
+    job->path = path.toStdString();
+    job->start = start;
+    job->size = size;
+    job->out.open(job->path, std::ios::binary | std::ios::trunc);
+    if(!job->out)
+    {
+        emit logMessage(QStringLiteral("[x64dbg] %1").arg(tr("Memory dump failed writing %1").arg(path)));
+        emit dumpFinished();
+        return;
+    }
+    mDumpCancelled = false;
+    QMetaObject::invokeMethod(&mWorker, [this, job] { dumpChunk(job); }, Qt::QueuedConnection);
+}
+
+void DbgAdapter::cancelDump()
+{
+    mDumpCancelled = true;
+}
+
+void DbgAdapter::dumpChunk(const std::shared_ptr<DumpJob> & job)
+{
+    const auto fail = [&](const QString & message)
+    {
+        job->out.close();
+        std::remove(job->path.c_str());
+        emit logMessage(QStringLiteral("[x64dbg] %1").arg(message));
+        emit dumpFinished();
+    };
+
+    if(mDumpCancelled)
+    {
+        fail(tr("Memory dump cancelled"));
+        return;
+    }
+
+    const duint address = job->start + job->done;
+    const duint chunk = std::min(kMemoryDumpChunkSize, job->size - job->done);
+    std::vector<char> buffer(chunk);
+    if(!ElfBugMemRead(mDebugger, address, buffer.data(), chunk))
+    {
+        fail(tr("Memory dump failed reading %1").arg(ToPtrString(address)));
+        return;
+    }
+    job->out.write(buffer.data(), static_cast<std::streamsize>(chunk));
+    job->done += chunk;
+    if(job->done == job->size)
+        job->out.close();
+    if(!job->out)
+    {
+        fail(tr("Memory dump failed writing %1").arg(QString::fromStdString(job->path)));
+        return;
+    }
+
+    emit dumpProgress(job->done, job->size);
+    if(job->done < job->size)
+    {
+        QMetaObject::invokeMethod(&mWorker, [this, job] { dumpChunk(job); }, Qt::QueuedConnection);
+        return;
+    }
+    emit logMessage(QStringLiteral("[x64dbg] %1").arg(tr("%1[%2] written to \"%3\" !")
+                    .arg(ToPtrString(job->start), ToHexString(job->size), QString::fromStdString(job->path))));
+    emit dumpFinished();
 }
 
 void DbgAdapter::onCreateProcess(const pid_t pid, const uint64_t entryPoint, void* userdata)
@@ -439,6 +565,7 @@ void DbgAdapter::onExitProcess(const int exitCode, void* userdata)
     emit self->processExited(exitCode);
     emit self->sessionEnded();
     self->scheduleThreadRefresh();
+    self->scheduleMemoryMapRefresh();
 }
 
 void DbgAdapter::onCreateThread(const pid_t tid, void* userdata)
@@ -485,6 +612,7 @@ void DbgAdapter::onExec(void* userdata)
     const auto self = static_cast<DbgAdapter*>(userdata);
     emit self->logMessage(QStringLiteral("[x64dbg] %1").arg(tr("The debuggee replaced its image with execve")));
     self->scheduleThreadRefresh();
+    self->scheduleMemoryMapRefresh();
 }
 
 void DbgAdapter::onDetach(void* userdata)
@@ -498,6 +626,7 @@ void DbgAdapter::onDetach(void* userdata)
     emit self->processDetached();
     emit self->sessionEnded();
     self->scheduleThreadRefresh();
+    self->scheduleMemoryMapRefresh();
 }
 
 void DbgAdapter::onBreakpoint(const uint64_t address, void* userdata)
